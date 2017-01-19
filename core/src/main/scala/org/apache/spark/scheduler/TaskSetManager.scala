@@ -196,6 +196,7 @@ private[spark] class TaskSetManager(
           }
         case _ =>
       }
+      logInfo(s"Locality test : Task $index has location at ${loc.host}")
       pendingTasksForHost.getOrElseUpdate(loc.host, new ArrayBuffer) += index
       for (rack <- sched.getRackForHost(loc.host)) {
         pendingTasksForRack.getOrElseUpdate(rack, new ArrayBuffer) += index

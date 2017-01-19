@@ -195,8 +195,15 @@ class FileScanRDD(
   override protected def getPartitions: Array[RDDPartition] = filePartitions.toArray
 
   override protected def getPreferredLocations(split: RDDPartition): Seq[String] = {
+    logInfo(s"Locality test : enter FileScanRDD")
     val files = split.asInstanceOf[FilePartition].files
-
+    for (file <- files) {
+      logInfo(s"Locality test : fileName = ${file.filePath};" +
+        s"length = ${file.length}; start = ${file.start}")
+      for (location <- file.locations) {
+        logInfo(s"Locality test : location = $location")
+      }
+    }
     // Computes total number of bytes can be retrieved from each host.
     val hostToNumBytes = mutable.HashMap.empty[String, Long]
     files.foreach { file =>
@@ -204,12 +211,19 @@ class FileScanRDD(
         hostToNumBytes(host) = hostToNumBytes.getOrElse(host, 0L) + file.length
       }
     }
+    
+    for (it <- hostToNumBytes) {
+      logInfo(s"Locality test : ${it._1} : ${it._2}")
+    }
 
     // Takes the first 3 hosts with the most data to be retrieved
+    /*
     hostToNumBytes.toSeq.sortBy {
       case (host, numBytes) => numBytes
     }.reverse.take(3).map {
       case (host, numBytes) => host
     }
+    */
+    hostToNumBytes.keySet.toSeq
   }
 }

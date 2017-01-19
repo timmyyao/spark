@@ -971,7 +971,10 @@ class DAGScheduler(
         runningStages -= stage
         return
     }
-
+    logInfo(s"Locality test : stage ${stage.id} is ${stage.rdd.getClass()}")
+    for(tt <- taskIdToLocations) {
+      logInfo(s"Locality test : taskIdToLocations ${tt._1} at ${tt._2}")
+    }
     stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
     listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
 
@@ -1549,6 +1552,10 @@ class DAGScheduler(
     }
     // If the RDD has some placement preferences (as is the case for input RDDs), get those
     val rddPrefs = rdd.preferredLocations(rdd.partitions(partition)).toList
+    logInfo(s"Locality test : partition ${partition} is ${rdd.partitions(partition).getClass()}")
+    for (loc <- rddPrefs) {
+      logInfo(s"Locality test : located on ${loc}")
+    }
     if (rddPrefs.nonEmpty) {
       return rddPrefs.map(TaskLocation(_))
     }
