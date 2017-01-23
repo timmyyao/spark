@@ -198,10 +198,14 @@ class FileScanRDD(
     }
 
     // Takes the first 3 hosts with the most data to be retrieved
+    /*
     hostToNumBytes.toSeq.sortBy {
       case (host, numBytes) => numBytes
     }.reverse.take(3).map {
       case (host, numBytes) => host
     }
+    */
+    // Takes all hosts
+    hostToNumBytes.keySet.toSeq
   }
 }
