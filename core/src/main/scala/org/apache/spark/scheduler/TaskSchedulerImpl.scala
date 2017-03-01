@@ -61,6 +61,9 @@ private[spark] class TaskSchedulerImpl(
 
   val conf = sc.conf
 
+  // Whether locality order according to storage type should be on
+  private val LOCALITY_STORAGE_TYPE = conf.getBoolean("spark.locality.storagetype", false)
+
   // How often to check for speculative tasks
   val SPECULATION_INTERVAL_MS = conf.getTimeAsMs("spark.speculation.interval", "100ms")
 
@@ -252,14 +255,15 @@ private[spark] class TaskSchedulerImpl(
       maxLocality: TaskLocality,
       shuffledOffers: Seq[WorkerOffer],
       availableCpus: Array[Int],
-      tasks: IndexedSeq[ArrayBuffer[TaskDescription]]) : Boolean = {
+      tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
+      storageLevel: Int) : Boolean = {
     var launchedTask = false
     for (i <- 0 until shuffledOffers.size) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
       if (availableCpus(i) >= CPUS_PER_TASK) {
         try {
-          for (task <- taskSet.resourceOffer(execId, host, maxLocality)) {
+          for (task <- taskSet.resourceOffer(execId, host, maxLocality, Option(storageLevel))) {
             tasks(i) += task
             val tid = task.taskId
             taskIdToTaskSetManager(tid) = taskSet
@@ -327,11 +331,25 @@ private[spark] class TaskSchedulerImpl(
       var launchedAnyTask = false
       var launchedTaskAtCurrentMaxLocality = false
       for (currentMaxLocality <- taskSet.myLocalityLevels) {
+        // Implementation with storage type order
+        var storageLevel = 0
+        while (!taskSet.allStorageLevelVisited(storageLevel)) {
+          logInfo(s"Locality test: visit storage level $storageLevel")
+          do {
+            launchedTaskAtCurrentMaxLocality = resourceOfferSingleTaskSet(
+              taskSet, currentMaxLocality, shuffledOffers, availableCpus, tasks, storageLevel)
+            launchedAnyTask |= launchedTaskAtCurrentMaxLocality
+          } while (launchedTaskAtCurrentMaxLocality)
+          storageLevel += 1
+        }
+        // Original implementation
+        /*
         do {
           launchedTaskAtCurrentMaxLocality = resourceOfferSingleTaskSet(
             taskSet, currentMaxLocality, shuffledOffers, availableCpus, tasks)
           launchedAnyTask |= launchedTaskAtCurrentMaxLocality
         } while (launchedTaskAtCurrentMaxLocality)
+        */
       }
       if (!launchedAnyTask) {
         taskSet.abortIfCompletelyBlacklisted(executorIdToHost.keys)

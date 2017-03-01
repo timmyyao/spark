@@ -17,6 +17,8 @@
 
 package org.apache.spark.scheduler
 
+import org.apache.hadoop.fs.StorageType
+
 /**
  * A location where a task should run. This can either be a host or a (host, executorID) pair.
  * In the latter case, we will prefer to launch the task on that executorID, but our next level
@@ -49,6 +51,23 @@ private [spark] case class HDFSCacheTaskLocation(override val host: String) exte
   override def toString: String = TaskLocation.inMemoryLocationTag + host
 }
 
+/**
+ * A location on a host with storage type information.
+ */
+private [spark] case class HostTaskLocationWithStorageType(override val host: String,
+  storageType: StorageType) extends TaskLocation {
+  override def toString: String = s"${TaskLocation.storageTypeTag}${host}_${storageType.toString}"
+}
+
+/**
+ * A location on a host with storage type information that is cached by HDFS.
+ */
+private [spark] case class HDFSCacheTaskLocationWithStorageType(override val host: String,
+  storageType: StorageType) extends TaskLocation {
+  override def toString: String = TaskLocation.inMemoryLocationTag +
+    s"${TaskLocation.storageTypeTag}${host}_${storageType.toString}"
+}
+
 private[spark] object TaskLocation {
   // We identify hosts on which the block is cached with this prefix.  Because this prefix contains
   // underscores, which are not legal characters in hostnames, there should be no potential for
@@ -57,6 +76,9 @@ private[spark] object TaskLocation {
 
   // Identify locations of executors with this prefix.
   val executorLocationTag = "executor_"
+
+  // Identify locations with storage type
+  val storageTypeTag = "storage_type_"
 
   def apply(host: String, executorId: String): TaskLocation = {
     new ExecutorCacheTaskLocation(host, executorId)
@@ -76,11 +98,28 @@ private[spark] object TaskLocation {
         require(splits.length == 2, "Illegal executor location format: " + str)
         val Array(host, executorId) = splits
         new ExecutorCacheTaskLocation(host, executorId)
+      } else if (str.startsWith(storageTypeTag)) {
+        val splits = parseStorageType(str)
+        new HostTaskLocationWithStorageType(splits(0), StorageType.valueOf(splits(1)))
       } else {
         new HostTaskLocation(str)
       }
     } else {
-      new HDFSCacheTaskLocation(hstr)
+      if (hstr.startsWith(storageTypeTag)) {
+        val splits = parseStorageType(str)
+        new HDFSCacheTaskLocationWithStorageType(splits(0), StorageType.valueOf(splits(1)))
+      } else {
+        new HDFSCacheTaskLocation(hstr)
+      }
+    }
+  }
+
+  private def parseStorageType(str: String): Array[String] = {
+    if (str.startsWith(storageTypeTag)) {
+      val hostAndStorageType = str.stripPrefix(storageTypeTag)
+      hostAndStorageType.split("_", 2)
+    } else {
+      new Array[String](0)
     }
   }
 }

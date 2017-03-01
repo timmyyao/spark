@@ -23,8 +23,8 @@ import java.util.Date
 
 import scala.collection.immutable.Map
 import scala.reflect.ClassTag
-
 import org.apache.hadoop.conf.{Configurable, Configuration}
+import org.apache.hadoop.fs.StorageType
 import org.apache.hadoop.mapred.FileSplit
 import org.apache.hadoop.mapred.InputFormat
 import org.apache.hadoop.mapred.InputSplit
@@ -37,14 +37,13 @@ import org.apache.hadoop.mapred.TaskID
 import org.apache.hadoop.mapred.lib.CombineFileSplit
 import org.apache.hadoop.mapreduce.TaskType
 import org.apache.hadoop.util.ReflectionUtils
-
 import org.apache.spark._
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.HadoopRDD.HadoopMapPartitionsWithSplitRDD
-import org.apache.spark.scheduler.{HDFSCacheTaskLocation, HostTaskLocation}
+import org.apache.spark.scheduler._
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.{NextIterator, SerializableConfiguration, ShutdownHookManager, Utils}
 
@@ -62,7 +61,8 @@ private[spark] class HadoopPartition(rddId: Int, override val index: Int, s: Inp
 
   /**
    * Get any environment variables that should be added to the users environment when running pipes
-   * @return a Map with the environment variables and corresponding values, it could be empty
+    *
+    * @return a Map with the environment variables and corresponding values, it could be empty
    */
   def getPipeEnvVars(): Map[String, String] = {
     val envVars: Map[String, String] = if (inputSplit.value.isInstanceOf[FileSplit]) {
@@ -196,6 +196,7 @@ class HadoopRDD[K, V](
     // add the credentials here as this can be called before SparkContext initialized
     SparkHadoopUtil.get.addCredentials(jobConf)
     val inputFormat = getInputFormat(jobConf)
+    logInfo(s"Locality test: InputFormat type is ${inputFormat.getClass}")
     val inputSplits = inputFormat.getSplits(jobConf, minPartitions)
     val array = new Array[Partition](inputSplits.size)
     for (i <- 0 until inputSplits.size) {
@@ -407,6 +408,7 @@ private[spark] object HadoopRDD extends Logging {
     val splitLocationInfo = Utils.classForName("org.apache.hadoop.mapred.SplitLocationInfo")
     val isInMemory = splitLocationInfo.getMethod("isInMemory")
     val getLocation = splitLocationInfo.getMethod("getLocation")
+    val getStorageType = splitLocationInfo.getMethod("getStorageType")
   }
 
   private[spark] val SPLIT_INFO_REFLECTIONS: Option[SplitInfoReflections] = try {
@@ -423,11 +425,26 @@ private[spark] object HadoopRDD extends Logging {
       val reflections = HadoopRDD.SPLIT_INFO_REFLECTIONS.get
       val locationStr = reflections.getLocation.invoke(loc).asInstanceOf[String]
       if (locationStr != "localhost") {
-        if (reflections.isInMemory.invoke(loc).asInstanceOf[Boolean]) {
-          logDebug(s"Partition $locationStr is cached by Hadoop.")
-          Some(HDFSCacheTaskLocation(locationStr).toString)
+        val storageType = reflections.getStorageType.invoke(loc).asInstanceOf[StorageType]
+        logInfo(s"Locality test: split type is ${storageType}")
+        if (storageType == null) {
+          if (reflections.isInMemory.invoke(loc).asInstanceOf[Boolean]) {
+            logDebug(s"Partition $locationStr is cached by Hadoop.")
+            logInfo(s"Locality test: TaskLocation type is HDFSCacheTaskLocation")
+            Some(HDFSCacheTaskLocation(locationStr).toString)
+          } else {
+            logInfo(s"Locality test: TaskLocation type is HostTaskLocation")
+            Some(HostTaskLocation(locationStr).toString)
+          }
         } else {
-          Some(HostTaskLocation(locationStr).toString)
+          if (reflections.isInMemory.invoke(loc).asInstanceOf[Boolean]) {
+            logDebug(s"Partition $locationStr is cached by Hadoop.")
+            logInfo(s"Locality test: TaskLocation type is HDFSCacheTaskLocation")
+            Some(HDFSCacheTaskLocationWithStorageType(locationStr, storageType).toString)
+          } else {
+            logInfo(s"Locality test: TaskLocation type is HDFSCacheTaskLocation")
+            Some(HostTaskLocationWithStorageType(locationStr, storageType).toString)
+          }
         }
       } else {
         None

@@ -28,6 +28,7 @@ import scala.collection.mutable.HashSet
 import scala.math.{max, min}
 import scala.util.control.NonFatal
 
+import org.apache.hadoop.fs.StorageType
 import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.SchedulingMode._
@@ -57,6 +58,8 @@ private[spark] class TaskSetManager(
   extends Schedulable with Logging {
 
   val conf = sched.sc.conf
+
+  private val LOCALITY_STORAGE_TYPE = conf.getBoolean("spark.locality.storagetype", false)
 
   /*
    * Sometimes if an executor is dead or in an otherwise invalid state, the driver
@@ -128,6 +131,10 @@ private[spark] class TaskSetManager(
   // but at host level.
   private val pendingTasksForHost = new HashMap[String, ArrayBuffer[Int]]
 
+  private val pendingTasksForHostWithOrder = new ArrayBuffer[HashMap[String, ArrayBuffer[Int]]]
+  private val pendingTasksInStorageType =
+    new HashMap[StorageType, HashMap[String, ArrayBuffer[Int]]]
+
   // Set of pending tasks for each rack -- similar to the above.
   private val pendingTasksForRack = new HashMap[String, ArrayBuffer[Int]]
 
@@ -182,6 +189,28 @@ private[spark] class TaskSetManager(
 
   var emittedTaskSizeWarning = false
 
+  private def addCacheTask(taskLocation: TaskLocation, index: Int): Unit = {
+    val exe = sched.getExecutorsAliveOnHost(taskLocation.host)
+    exe match {
+      case Some(set) =>
+        for (e <- set) {
+          pendingTasksForExecutor.getOrElseUpdate(e, new ArrayBuffer) += index
+        }
+        logInfo(s"Pending task $index has a cached location at ${taskLocation.host} " +
+          ", where there are executors " + set.mkString(","))
+      case None => logDebug(s"Pending task $index has a cached location " +
+        s"at ${taskLocation.host}, but there are no executors alive there.")
+    }
+  }
+
+  private def addStorageTypeTask(taskLocation: TaskLocation,
+    storageType: StorageType, index: Int): Unit = {
+    val pendingTasksForHostInLevel = pendingTasksInStorageType.getOrElseUpdate(storageType,
+      new HashMap[String, ArrayBuffer[Int]])
+    logInfo(s"Locality test: Pending task $index located on ${storageType.toString}")
+    pendingTasksForHostInLevel.getOrElseUpdate(taskLocation.host, new ArrayBuffer) += index
+  }
+
   /** Add a task to all the pending-task lists that it should be on. */
   private def addPendingTask(index: Int) {
     for (loc <- tasks(index).preferredLocations) {
@@ -189,22 +218,33 @@ private[spark] class TaskSetManager(
         case e: ExecutorCacheTaskLocation =>
           pendingTasksForExecutor.getOrElseUpdate(e.executorId, new ArrayBuffer) += index
         case e: HDFSCacheTaskLocation =>
-          val exe = sched.getExecutorsAliveOnHost(loc.host)
-          exe match {
-            case Some(set) =>
-              for (e <- set) {
-                pendingTasksForExecutor.getOrElseUpdate(e, new ArrayBuffer) += index
-              }
-              logInfo(s"Pending task $index has a cached location at ${e.host} " +
-                ", where there are executors " + set.mkString(","))
-            case None => logDebug(s"Pending task $index has a cached location at ${e.host} " +
-                ", but there are no executors alive there.")
-          }
+          addCacheTask(e, index)
+        case e: HDFSCacheTaskLocationWithStorageType =>
+          addCacheTask(e, index)
         case _ =>
       }
       pendingTasksForHost.getOrElseUpdate(loc.host, new ArrayBuffer) += index
+      logInfo(s"Locality test: Pending task $index has node location at ${loc.host}")
+      loc match {
+        case e: HDFSCacheTaskLocationWithStorageType =>
+          addStorageTypeTask(e, e.storageType, index)
+        case e: HostTaskLocationWithStorageType =>
+          addStorageTypeTask(e, e.storageType, index)
+        case _ =>
+      }
+
       for (rack <- sched.getRackForHost(loc.host)) {
         pendingTasksForRack.getOrElseUpdate(rack, new ArrayBuffer) += index
+      }
+    }
+
+    if (pendingTasksInStorageType.isEmpty) {
+      pendingTasksForHostWithOrder += pendingTasksForHost
+    } else {
+      for (storageType <- StorageType.values()) {
+        if (pendingTasksInStorageType.contains(storageType)) {
+          pendingTasksForHostWithOrder += pendingTasksInStorageType.get(storageType).get
+        }
       }
     }
 
@@ -229,6 +269,10 @@ private[spark] class TaskSetManager(
    */
   private def getPendingTasksForHost(host: String): ArrayBuffer[Int] = {
     pendingTasksForHost.getOrElse(host, ArrayBuffer())
+  }
+
+  private def getPendingTasksForHostWithOrder(host: String, storageLevel: Int): ArrayBuffer[Int] = {
+    pendingTasksForHostWithOrder(storageLevel).getOrElse(host, ArrayBuffer())
   }
 
   /**
@@ -363,7 +407,11 @@ private[spark] class TaskSetManager(
    *
    * @return An option containing (task index within the task set, locality, is speculative?)
    */
-  private def dequeueTask(execId: String, host: String, maxLocality: TaskLocality.Value)
+  private def dequeueTask(
+     execId: String,
+     host: String,
+     maxLocality: TaskLocality.Value,
+     storageLevel: Option[Int])
     : Option[(Int, TaskLocality.Value, Boolean)] =
   {
     for (index <- dequeueTaskFromList(execId, getPendingTasksForExecutor(execId))) {
@@ -371,8 +419,18 @@ private[spark] class TaskSetManager(
     }
 
     if (TaskLocality.isAllowed(maxLocality, TaskLocality.NODE_LOCAL)) {
-      for (index <- dequeueTaskFromList(execId, getPendingTasksForHost(host))) {
-        return Some((index, TaskLocality.NODE_LOCAL, false))
+      // Original implementation
+      if (!LOCALITY_STORAGE_TYPE || storageLevel.isEmpty) {
+        for (index <- dequeueTaskFromList(execId, getPendingTasksForHost(host))) {
+          return Some((index, TaskLocality.NODE_LOCAL, false))
+        }
+      }
+      // New implementation with storage level
+      else {
+        for (index <- dequeueTaskFromList(execId,
+          getPendingTasksForHostWithOrder(host, storageLevel.get))) {
+          return Some((index, TaskLocality.NODE_LOCAL, false))
+        }
       }
     }
 
@@ -403,6 +461,22 @@ private[spark] class TaskSetManager(
       case (taskIndex, allowedLocality) => (taskIndex, allowedLocality, true)}
   }
 
+
+  def allStorageLevelVisited(index: Int): Boolean = {
+    if (LOCALITY_STORAGE_TYPE) {
+      logInfo(s"Locality test: total number of storage levels " +
+        s"is ${pendingTasksForHostWithOrder.size}")
+      if (index >= pendingTasksForHostWithOrder.size) {
+        return true
+      }
+    }
+    else {
+      if (index >= 1) {
+        return true
+      }
+    }
+    false
+  }
   /**
    * Respond to an offer of a single executor from the scheduler by finding a task
    *
@@ -414,11 +488,21 @@ private[spark] class TaskSetManager(
    * @param host  the host Id of the offered resource
    * @param maxLocality the maximum locality we want to schedule the tasks at
    */
-  @throws[TaskNotSerializableException]
   def resourceOffer(
       execId: String,
       host: String,
       maxLocality: TaskLocality.TaskLocality)
+  : Option[TaskDescription] =
+  {
+    resourceOffer(execId, host, maxLocality, None)
+  }
+
+  @throws[TaskNotSerializableException]
+  def resourceOffer(
+      execId: String,
+      host: String,
+      maxLocality: TaskLocality.TaskLocality,
+      storageLevel: Option[Int])
     : Option[TaskDescription] =
   {
     if (!isZombie) {
@@ -434,7 +518,7 @@ private[spark] class TaskSetManager(
         }
       }
 
-      dequeueTask(execId, host, allowedLocality) match {
+      dequeueTask(execId, host, allowedLocality, storageLevel) match {
         case Some((index, taskLocality, speculative)) =>
           // Found a task; do some bookkeeping and return a task description
           val task = tasks(index)
